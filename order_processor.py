@@ -10,7 +10,7 @@ from playwright.async_api import async_playwright
 SPREADSHEET_ID = '1mAYW47RZaAHRThY35N7uh6K9J_59SO0t3hpXlg7dn5s'
 SHEET_NAME = 'Orders'
 SERVICE_ACCOUNT_FILE = 'service-account.json'
-HARMON_URL = 'https://order.harmonps.com/residential'
+HARMON_URL = 'https://order.harmonps.com/Login/'
 
 # Added Drive scope (full access) in addition to Sheets scope
 SCOPES = [
@@ -19,9 +19,9 @@ SCOPES = [
 ]
 
 # Column indices (1-based)
-COL_STATUS = 11        # 'Status'
-COL_RESULT = 12        # 'Result'
-COL_PROCESSED_AT = 14  # 'ProcessedAt'
+COL_STATUS = 11        
+COL_RESULT = 12        
+COL_PROCESSED_AT = 14 
 
 # ---------- Google Sheets helpers ----------
 print("[DEBUG] Loading credentials...")
