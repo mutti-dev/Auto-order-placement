@@ -1,180 +1,219 @@
 import os
+import time
 import asyncio
 from datetime import datetime
 from google.oauth2.service_account import Credentials
 from googleapiclient.discovery import build
-from googleapiclient.errors import HttpError          # <-- new import
-from playwright.async_api import async_playwright
+from googleapiclient.errors import HttpError
+from playwright.async_api import async_playwright, TimeoutError as PlaywrightTimeoutError
+from datetime import datetime, timedelta
 
 # ---------- CONFIG ----------
-SPREADSHEET_ID = '1mAYW47RZaAHRThY35N7uh6K9J_59SO0t3hpXlg7dn5s'
-SHEET_NAME = 'Orders'
-SERVICE_ACCOUNT_FILE = 'service-account.json'
-HARMON_URL = 'https://order.harmonps.com/Login/'
+SPREADSHEET_ID = '1mAYW47RZaAHRThY35N7uh6K9J_59SO0t3hpXlg7dn5s'  # update with your ID
+RANGE_NAME = 'Orders!A2:M'
 
-# Added Drive scope (full access) in addition to Sheets scope
-SCOPES = [
-    'https://www.googleapis.com/auth/spreadsheets',
-    'https://www.googleapis.com/auth/drive'   # <-- new: allows read/write on shared sheets
-]
+HARMON_URL = "https://order.harmonps.com/Login/"
 
-# Column indices (1-based)
-COL_STATUS = 11        
-COL_RESULT = 12        
-COL_PROCESSED_AT = 14 
+# Column mappings (1-based like Sheets)
+COL_CLIENT_NAME = 1
+COL_ADDRESS = 2
+COL_CITY = 3
+COL_STATE = 4
+COL_ZIP = 5
+COL_SQFT = 6
+COL_BILL_CITY = 7
+COL_BILL_STATE = 8
+COL_BILL_ZIP = 9
+COL_STATUS = 10
 
-# ---------- Google Sheets helpers ----------
-print("[DEBUG] Loading credentials...")
-creds = Credentials.from_service_account_file(SERVICE_ACCOUNT_FILE, scopes=SCOPES)
-sheets_service = build('sheets', 'v4', credentials=creds)
-sheet = sheets_service.spreadsheets()
-print(f"[DEBUG] Connected to Google Sheets API with service account: {creds.service_account_email}")
+# ---------- GOOGLE SHEETS ----------
+def get_service():
+    creds = Credentials.from_service_account_file(
+        "service-account.json",
+        scopes=["https://www.googleapis.com/auth/spreadsheets"],
+    )
+    return build("sheets", "v4", credentials=creds)
 
-def col_letter(col: int) -> str:
-    letters = ''
-    while col:
-        col, rem = divmod(col-1, 26)
-        letters = chr(65+rem) + letters
-    return letters
-
-def read_orders():
-    """Read rows from the Orders sheet. Raises a clear error if the service-account
-    lacks permission on the spreadsheet."""
-    range_name = f"{SHEET_NAME}!A2:Z"
-    print(f"[DEBUG] Reading rows from range: {range_name} in sheet {SPREADSHEET_ID}")
+def get_orders():
     try:
-        result = sheet.values().get(spreadsheetId=SPREADSHEET_ID,
-                                   range=range_name).execute()
+        service = get_service()
+        result = (
+            service.spreadsheets()
+            .values()
+            .get(spreadsheetId=SPREADSHEET_ID, range=RANGE_NAME)
+            .execute()
+        )
+        return result.get("values", [])
     except HttpError as err:
-        print(f"[DEBUG] HttpError while reading rows: {err}")
-        if err.resp.status == 403:
-            raise PermissionError(
-                f"The service account does not have access to spreadsheet "
-                f"{SPREADSHEET_ID}. Share the sheet with "
-                f"{creds.service_account_email} or use a sheet the account can read."
-            )
-        raise
-    values = result.get('values', [])
-    print(f"[DEBUG] Retrieved {len(values)} rows from sheet.")
-    return values
+        print(f"Google Sheets API error: {err}")
+        return []
 
-def update_row(row_idx, col_idx, value):
-    range_name = f"{SHEET_NAME}!{col_letter(col_idx)}{row_idx}"
-    print(f"[DEBUG] Updating row {row_idx}, col {col_idx} ({range_name}) with value: {value}")
-    body = {'values': [[value]]}
-    sheet.values().update(
-        spreadsheetId=SPREADSHEET_ID,
-        range=range_name,
-        valueInputOption='RAW',
-        body=body
-    ).execute()
+def mark_order_processed(row_index, status):
+    """Mark the row as processed with timestamp."""
+    try:
+        service = get_service()
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        body = {"values": [[status, now]]}
+        service.spreadsheets().values().update(
+            spreadsheetId=SPREADSHEET_ID,
+            range=f"Orders!M{row_index+2}:N{row_index+2}",  # M=status, N=timestamp
+            valueInputOption="RAW",
+            body=body,
+        ).execute()
+    except HttpError as err:
+        print(f"Failed to update sheet: {err}")
 
-# ---------- Playwright order filler ----------
-async def fill_order(page, order):
-    """
-    order is a list of values from the sheet row.
-    Adjust indexes according to your sheet columns.
-    """
-    client_name = order[1] if len(order) > 1 else ''
-    address = order[2] if len(order) > 2 else ''
-    city = order[3] if len(order) > 3 else ''
-    state = order[4] if len(order) > 4 else ''
-    zip_code = order[5] if len(order) > 5 else ''
-    sqft = order[6] if len(order) > 6 else ''
-    package_name = order[7] if len(order) > 7 else ''
-
-    print(f"[DEBUG] Starting order fill: {client_name}, {address}, {city}, {state}, {zip_code}, sqft={sqft}, package={package_name}")
+# ---------- HARMON LOGIN ----------
+async def login(page):
+    email = os.getenv("HARMON_USER", "orders@harmonps.com")
+    password = os.getenv("HARMON_PASS", "9awzv85H6%X97*2jU&")
 
     await page.goto(HARMON_URL)
-    print(f"[DEBUG] Navigated to {HARMON_URL}")
 
-    # Fill form fields (adjust selectors based on inspection)
-    await page.fill('input[name="ClientName"]', client_name)
-    await page.fill('input[name="Address"]', address)
-    await page.fill('input[name="City"]', city)
-    await page.select_option('select[name="State"]', label=state)
-    await page.fill('input[name="Zip"]', zip_code)
-    await page.fill('input[name="SquareFeet"]', sqft)
+    form = page.locator("form").filter(
+        has_text="Secure Access Email Address * Password * Access My Account Don't have an"
+    )
+    await form.locator('input[name="sEmail"]').fill(email)
+    await form.locator('input[name="sPassword"]').fill(password)
+    await form.locator('input[name="sPassword"]').press("Enter")
 
-    # Select service package
-    if package_name:
-        try:
-            await page.click(f'//label[contains(text(), "{package_name}")]')
-            print(f"[DEBUG] Selected package: {package_name}")
-        except:
-            print(f"[DEBUG] Package not found: {package_name}")
+    # wait for dashboard
+    await page.wait_for_url("https://order.harmonps.com/Dashboard/", timeout=60000)
 
-    # Confirm address if button exists
+# ---------- ORDER FILLING ----------
+async def fill_order(page, order):
+    """Fill the order form with row data from Sheets."""
+
+    # extract fields safely
+    client_name   = order[COL_CLIENT_NAME]
+    address       = order[COL_ADDRESS]
+    city          = order[COL_CITY]
+    state         = order[COL_STATE]
+    zip_code      = order[COL_ZIP]
+    sqft          = order[COL_SQFT]
+    billing_city  = order[COL_BILL_CITY]
+    billing_state = order[COL_BILL_STATE]
+    billing_zip   = order[COL_BILL_ZIP]
+
+
+    print(f"Filling order for {client_name} and index {COL_CLIENT_NAME}")
+
+    # ---- Navigate to New Site -----------------------------------------
+    await page.goto("https://order.harmonps.com/Sites/NewSite.asp",
+                    timeout=60000, wait_until="networkidle")
+
     try:
-        await page.click('//button[contains(., "Confirm Address")]')
-        print("[DEBUG] Clicked confirm address button")
+        await page.wait_for_load_state("networkidle")
     except:
-        print("[DEBUG] No confirm address button found")
+        pass
 
-    # Submit the form
-    await page.click('button[type="submit"]')
-    print("[DEBUG] Submitted form, waiting for response...")
+    # ---- Fill site details ---------------------------------------------
+    # await page.get_by_role("textbox", name="Enter a location").fill("Main Office")
+    await page.locator('input[name="sAddress"]').fill(address or "123 Main Street")
+    await page.locator('input[name="sAddress2"]').fill("Suite 456")
+    await page.locator('input[name="sCity"]').fill(city or "Carrboro")
+    await page.get_by_role("combobox").select_option(state or "NC")
+    await page.locator('input[name="sZipcode"]').fill(zip_code or "10001")
 
-    # Wait for success or error
+    # ---- Manual Order Entry --------------------------------------------
+    await page.get_by_text("Manual Order Entry").click()
+    await page.get_by_role("radio", name="Manual Order Entry - Order").check()
+
+    if client_name:
+        
+        await page.locator('input[name="UserComboSearch"]').fill(client_name)
+        time.sleep(0.5)
+        await page.get_by_role("listitem").first.click()
+
+
+    await page.get_by_role("button", name="Create New Site").click()
+
+    # await page.wait_for_load_state("networkidle", timeout=60000)
+       
+
+    # ---- Order specifics -----------------------------------------------
+    await page.locator('input[name="squarefeet"]').fill(sqft or "10001")
+    await page.get_by_text("Hidden / Extra Products (NOTE").click()
+    await page.wait_for_timeout(500)
+    await page.get_by_role("checkbox", name="Manual Order $").check()
+
+    today_day = datetime.today().day
+    for offset in [1, 2]:
+        day_to_select = today_day + offset
+        locator = page.get_by_role("cell", name=f"{day_to_select} Select").get_by_role("button")
+        await locator.click()
+    # await page.get_by_role("cell", name="17 Select").get_by_role("button").click()
+    # await page.get_by_role("cell", name="18 Select").get_by_role("button").click()
+    await page.get_by_role("checkbox", name="Skip Scheduling for Now  (").check()
+
+  
+    await page.locator("input[name='search_BillingCity']").fill(city or "123 Main Street")
+
+   
+
+    await page.locator("select[name='search_BillingState']").select_option(state or "NC")
+
+  
+    await page.locator("input[name='search_BillingZipcode']").fill(zip_code or "10001")
+
+    # ---- Final confirmations -------------------------------------------
+    await page.get_by_role("checkbox", name="I Agree * required").check()
+    await page.get_by_role("checkbox", name="Do NOT send invoice/receipt").check()
+
+    # ---- Place order ---------------------------------------------------
+    await page.get_by_role("button", name="Place My Order!").click()
+
+    # ---- Confirm -------------------------------------------------------
     try:
-        await page.wait_for_selector('//div[contains(., "Order Created")]', timeout=10000)
-        print("[DEBUG] Order created successfully")
+        await page.get_by_text("Your order has been placed.").wait_for(timeout=30000)
         return "ORDER_SUCCESS"
     except:
-        try:
-            err_text = await page.inner_text('.error')
-            print(f"[DEBUG] Error detected after submit: {err_text}")
-            return f"ERROR: {err_text}"
-        except:
-            print("[DEBUG] Unknown error after submit")
-            return "ERROR: unknown after submit"
+        return "ERROR: No confirmation"
 
-# ---------- Main runner ----------
-async def main(override_sheet_id: str = None):
-    # Allow the webhook to override the spreadsheet ID
-    global SPREADSHEET_ID
-    if override_sheet_id:
-        SPREADSHEET_ID = override_sheet_id
-        print(f"[DEBUG] Overriding SPREADSHEET_ID with: {SPREADSHEET_ID}")
-
-    print("[DEBUG] Reading orders...")
-    rows = read_orders()
-    row_number = 2
+# ---------- MAIN RUNNER ----------
+async def main():
+    orders = get_orders()
+    if not orders:
+        print("No orders found.")
+        return
 
     async with async_playwright() as p:
-        print("[DEBUG] Launching Chromium browser...")
         browser = await p.chromium.launch(headless=False)
         page = await browser.new_page()
 
-        for r in rows:
-            status = r[10] if len(r) > 10 else ''
-            print(f"[DEBUG] Processing row {row_number}, current status: {status} and rows data: {r}")
+        await login(page)
 
-            
-            if status.strip().upper() != 'PENDING':
-                print(f"[DEBUG] Skipping row {row_number} (status not PENDING)")
-                row_number += 1
-                continue
-
-            update_row(row_number, COL_STATUS, 'IN_PROGRESS')
-
+        for i, order in enumerate(orders):
             try:
-                result = await fill_order(page, r)
-                update_row(row_number, COL_RESULT, result)
-                update_row(row_number, COL_STATUS,
-                           'DONE' if 'ORDER_SUCCESS' in result else 'FAILED')
-                update_row(row_number, COL_PROCESSED_AT,
-                           datetime.utcnow().isoformat())
-                print(f"[DEBUG] Row {row_number} processed: {result}")
+                status = await fill_order(page, order)
+                mark_order_processed(i, status)
+                print(f"Row {i+2}: {status}")
             except Exception as e:
-                update_row(row_number, COL_RESULT, f"EXCEPTION: {str(e)}")
-                update_row(row_number, COL_STATUS, 'FAILED')
-                print(f"[DEBUG] Exception processing row {row_number}: {e}")
-            row_number += 1
+                print(f"Row {i+2}: ERROR {e}")
+                mark_order_processed(i, f"ERROR: {e}")
 
         await browser.close()
-        print("[DEBUG] Browser closed, all done!")
 
-if __name__ == '__main__':
-    print("[DEBUG] Starting main()")
-    asyncio.run(main())
+async def main(*args, **kwargs):
+    orders = get_orders()
+    if not orders:
+        print("No orders found.")
+        return
+
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(headless=False)
+        page = await browser.new_page()
+
+        await login(page)
+
+        for i, order in enumerate(orders):
+            try:
+                status = await fill_order(page, order)
+                mark_order_processed(i, status)
+                print(f"Row {i+2}: {status}")
+            except Exception as e:
+                print(f"Row {i+2}: ERROR {e}")
+                mark_order_processed(i, f"ERROR: {e}")
+
+        await browser.close()
+
