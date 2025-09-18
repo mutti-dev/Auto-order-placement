@@ -1,3 +1,5 @@
+# order_processor.py
+
 import os
 import time
 import asyncio
@@ -209,7 +211,10 @@ async def main(*args, **kwargs):
         for i, order in enumerate(orders):
             try:
                 status = await fill_order(page, order)
-                mark_order_processed(i, status)
+                if status == "ORDER_SUCCESS":
+                    mark_order_processed(i, "COMPLETED")
+                else:
+                    mark_order_processed(i, status)
                 print(f"Row {i+2}: {status}")
             except Exception as e:
                 print(f"Row {i+2}: ERROR {e}")

@@ -1,4 +1,4 @@
-//it will be used in google appscript
+//it will be used in google appscript  google_appscript.js
 
 const WEBHOOK_URL = "https://9e33eb09ac27.ngrok-free.app/start-orders"; 
 
